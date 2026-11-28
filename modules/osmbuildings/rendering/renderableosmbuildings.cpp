@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <mutex>
 
 using namespace gl;
 
@@ -19,6 +20,10 @@ namespace {
     constexpr std::string_view _loggerCat = "RenderableOsmBuildings";
     constexpr double EarthRadius = 6378137.0;
     constexpr int TileZoom = 15;
+    constexpr size_t MaxConcurrentRequests = 6;
+    constexpr double MaxTileKeepDistance = 45000.0; // 45 km eviction radius
+
+    std::once_flag curlInitFlag;
 
     constexpr openspace::StringPropertyInfo ServerUrlInfo = {
         .identifier = "ServerUrl",
@@ -70,12 +75,37 @@ namespace {
 
     std::pair<int, int> latLonToTile(double latDeg, double lonDeg, int z) {
         const double n = std::pow(2.0, z);
-        const int x = static_cast<int>(std::floor((lonDeg + 180.0) / 360.0 * n));
-        const double latRad = glm::radians(latDeg);
-        const int y = static_cast<int>(std::floor(
-            (1.0 - std::asinh(std::tan(latRad)) / glm::pi<double>()) / 2.0 * n
-        ));
+        const int maxTile = static_cast<int>(n) - 1;
+        const int x = glm::clamp(
+            static_cast<int>(std::floor((lonDeg + 180.0) / 360.0 * n)),
+            0,
+            maxTile
+        );
+        const double latRad = glm::radians(glm::clamp(latDeg, -85.0511, 85.0511));
+        const int y = glm::clamp(
+            static_cast<int>(std::floor(
+                (1.0 - std::asinh(std::tan(latRad)) / glm::pi<double>()) / 2.0 * n
+            )),
+            0,
+            maxTile
+        );
         return { x, y };
+    }
+
+    glm::dvec3 computeLookAtSurfacePoint(
+        const glm::dvec3& camEcef,
+        const glm::dvec3& viewDirEcef)
+    {
+        const double b = glm::dot(camEcef, viewDirEcef);
+        const double c = glm::dot(camEcef, camEcef) - EarthRadius * EarthRadius;
+        const double disc = b * b - c;
+        if (disc > 0.0) {
+            const double t = -b - std::sqrt(disc);
+            if (t > 0.0 && t < 35000.0) {
+                return camEcef + viewDirEcef * t;
+            }
+        }
+        return glm::normalize(camEcef) * EarthRadius;
     }
 } // namespace
 
@@ -93,6 +123,10 @@ RenderableOsmBuildings::RenderableOsmBuildings(const Dictionary& dictionary)
     , _activationAltitude(ActivationAltitudeInfo)
     , _buildingOpacity(OpacityInfo)
 {
+    std::call_once(curlInitFlag, []() {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+
     const Parameters p = codegen::bake<Parameters>(dictionary);
 
     _serverUrl = p.serverUrl.value_or("http://127.0.0.1:8765");
@@ -115,9 +149,11 @@ void RenderableOsmBuildings::initializeGL() {
 
 void RenderableOsmBuildings::deinitializeGL() {
     for (auto& [key, tile] : _gpuTiles) {
-        glDeleteVertexArrays(1, &tile.vao);
-        glDeleteBuffers(1, &tile.vbo);
-        glDeleteBuffers(1, &tile.ibo);
+        if (tile.vao != 0) {
+            glDeleteVertexArrays(1, &tile.vao);
+            glDeleteBuffers(1, &tile.vbo);
+            glDeleteBuffers(1, &tile.ibo);
+        }
     }
     _gpuTiles.clear();
 
@@ -141,6 +177,7 @@ std::optional<RenderableOsmBuildings::TileMeshData> RenderableOsmBuildings::fetc
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &raw);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
     const CURLcode res = curl_easy_perform(curl);
@@ -172,12 +209,19 @@ std::optional<RenderableOsmBuildings::TileMeshData> RenderableOsmBuildings::fetc
     mesh.vertices.resize(vertCount * 8);
     mesh.indices.resize(idxCount);
 
-    std::memcpy(mesh.vertices.data(), raw.data() + 32, vertBytes);
-    std::memcpy(mesh.indices.data(), raw.data() + 32 + vertBytes, idxBytes);
+    if (vertBytes > 0) {
+        std::memcpy(mesh.vertices.data(), raw.data() + 32, vertBytes);
+    }
+    if (idxBytes > 0) {
+        std::memcpy(mesh.indices.data(), raw.data() + 32 + vertBytes, idxBytes);
+    }
     return mesh;
 }
 
 void RenderableOsmBuildings::requestTileIfNeeded(int z, int x, int y) {
+    if (_inFlight.size() >= MaxConcurrentRequests) {
+        return;
+    }
     const std::string key = std::format("{}_{}_{}", z, x, y);
     if (_gpuTiles.contains(key) || _inFlight.contains(key)) {
         return;
@@ -192,6 +236,23 @@ void RenderableOsmBuildings::requestTileIfNeeded(int z, int x, int y) {
     );
 }
 
+void RenderableOsmBuildings::evictDistantTiles(const glm::dvec3& camEcef, double maxDistMeters) {
+    auto it = _gpuTiles.begin();
+    while (it != _gpuTiles.end()) {
+        if (glm::distance(camEcef, it->second.originEcef) > maxDistMeters) {
+            if (it->second.vao != 0) {
+                glDeleteVertexArrays(1, &it->second.vao);
+                glDeleteBuffers(1, &it->second.vbo);
+                glDeleteBuffers(1, &it->second.ibo);
+            }
+            it = _gpuTiles.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
 void RenderableOsmBuildings::update(const UpdateData&) {
     auto it = _pendingFutures.begin();
     while (it != _pendingFutures.end()) {
@@ -200,42 +261,44 @@ void RenderableOsmBuildings::update(const UpdateData&) {
             _inFlight.erase(key);
 
             std::optional<TileMeshData> result = it->second.get();
-            if (result.has_value() && !result->indices.empty()) {
+            if (result.has_value()) {
                 GpuTile gpu;
                 gpu.indexCount = static_cast<GLsizei>(result->indices.size());
                 gpu.originEcef = result->originEcef;
 
-                glCreateVertexArrays(1, &gpu.vao);
-                glCreateBuffers(1, &gpu.vbo);
-                glCreateBuffers(1, &gpu.ibo);
+                if (!result->indices.empty()) {
+                    glCreateVertexArrays(1, &gpu.vao);
+                    glCreateBuffers(1, &gpu.vbo);
+                    glCreateBuffers(1, &gpu.ibo);
 
-                glNamedBufferData(
-                    gpu.vbo,
-                    result->vertices.size() * sizeof(float),
-                    result->vertices.data(),
-                    GL_STATIC_DRAW
-                );
-                glNamedBufferData(
-                    gpu.ibo,
-                    result->indices.size() * sizeof(uint32_t),
-                    result->indices.data(),
-                    GL_STATIC_DRAW
-                );
+                    glNamedBufferData(
+                        gpu.vbo,
+                        result->vertices.size() * sizeof(float),
+                        result->vertices.data(),
+                        GL_STATIC_DRAW
+                    );
+                    glNamedBufferData(
+                        gpu.ibo,
+                        result->indices.size() * sizeof(uint32_t),
+                        result->indices.data(),
+                        GL_STATIC_DRAW
+                    );
 
-                glVertexArrayVertexBuffer(gpu.vao, 0, gpu.vbo, 0, 8 * sizeof(float));
-                glVertexArrayElementBuffer(gpu.vao, gpu.ibo);
+                    glVertexArrayVertexBuffer(gpu.vao, 0, gpu.vbo, 0, 8 * sizeof(float));
+                    glVertexArrayElementBuffer(gpu.vao, gpu.ibo);
 
-                glEnableVertexArrayAttrib(gpu.vao, 0);
-                glVertexArrayAttribFormat(gpu.vao, 0, 3, GL_FLOAT, GL_FALSE, 0);
-                glVertexArrayAttribBinding(gpu.vao, 0, 0);
+                    glEnableVertexArrayAttrib(gpu.vao, 0);
+                    glVertexArrayAttribFormat(gpu.vao, 0, 3, GL_FLOAT, GL_FALSE, 0);
+                    glVertexArrayAttribBinding(gpu.vao, 0, 0);
 
-                glEnableVertexArrayAttrib(gpu.vao, 1);
-                glVertexArrayAttribFormat(gpu.vao, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
-                glVertexArrayAttribBinding(gpu.vao, 1, 0);
+                    glEnableVertexArrayAttrib(gpu.vao, 1);
+                    glVertexArrayAttribFormat(gpu.vao, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
+                    glVertexArrayAttribBinding(gpu.vao, 1, 0);
 
-                glEnableVertexArrayAttrib(gpu.vao, 2);
-                glVertexArrayAttribFormat(gpu.vao, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float));
-                glVertexArrayAttribBinding(gpu.vao, 2, 0);
+                    glEnableVertexArrayAttrib(gpu.vao, 2);
+                    glVertexArrayAttribFormat(gpu.vao, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float));
+                    glVertexArrayAttribBinding(gpu.vao, 2, 0);
+                }
 
                 _gpuTiles.emplace(result->key, gpu);
             }
@@ -248,10 +311,6 @@ void RenderableOsmBuildings::update(const UpdateData&) {
 }
 
 void RenderableOsmBuildings::render(const RenderData& data, RendererTasks&) {
-    if (_gpuTiles.empty() && _inFlight.size() > 16) {
-        return;
-    }
-
     const glm::dmat4 modelTransform = calcModelTransform(data);
     const glm::dmat4 worldToModel = glm::inverse(modelTransform);
     const glm::dvec3 camEcef = glm::dvec3(
@@ -264,15 +323,30 @@ void RenderableOsmBuildings::render(const RenderData& data, RendererTasks&) {
         return;
     }
 
+    evictDistantTiles(camEcef, MaxTileKeepDistance);
+
+    // Blend sub-camera nadir point and forward look-at point so tiles load both under and ahead of camera
+    const glm::dvec3 nadirSurface = glm::normalize(camEcef) * EarthRadius;
+    const glm::dmat4 invView = glm::inverse(data.camera.combinedViewMatrix());
+    const glm::dvec3 camForwardWorld = glm::normalize(glm::dvec3(invView * glm::dvec4(0.0, 0.0, -1.0, 0.0)));
+    const glm::dvec3 camForwardEcef = glm::normalize(glm::dvec3(worldToModel * glm::dvec4(camForwardWorld, 0.0)));
+    const glm::dvec3 lookSurface = computeLookAtSurfacePoint(camEcef, camForwardEcef);
+    const glm::dvec3 focusSurface = glm::normalize(glm::mix(nadirSurface, lookSurface, 0.5)) * EarthRadius;
+
     const double latDeg = glm::degrees(
         std::asin(glm::clamp(camEcef.z / distFromCenter, -1.0, 1.0))
     );
     const double lonDeg = glm::degrees(std::atan2(camEcef.y, camEcef.x));
 
+    // Request concentric rings (closest first) in a 7x7 grid (~3.2 km radius) around camera nadir
     const auto [cx, cy] = latLonToTile(latDeg, lonDeg, TileZoom);
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            requestTileIfNeeded(TileZoom, cx + dx, cy + dy);
+    for (int radius = 0; radius <= 3; ++radius) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            for (int dy = -radius; dy <= radius; ++dy) {
+                if (std::abs(dx) == radius || std::abs(dy) == radius) {
+                    requestTileIfNeeded(TileZoom, cx + dx, cy + dy);
+                }
+            }
         }
     }
 
@@ -286,13 +360,21 @@ void RenderableOsmBuildings::render(const RenderData& data, RendererTasks&) {
     const glm::dmat4 viewMat = data.camera.combinedViewMatrix();
     const glm::mat4 projMat = data.camera.projectionMatrix();
 
-    // Transform sun direction into camera/view space to match normalMatrix
+    // Light from slightly offset local zenith above the camera so roofs and facades are brightly lit
+    const glm::dvec3 localUpEcef = glm::normalize(camEcef);
+    const glm::dvec3 lightDirEcef = glm::normalize(localUpEcef + glm::dvec3(0.25, -0.25, 0.35));
     const glm::vec3 sunDirView = glm::normalize(
-        glm::mat3(viewMat * modelTransform) * glm::vec3(1.0f, 0.5f, 0.5f)
+        glm::mat3(viewMat * modelTransform) * glm::vec3(lightDirEcef)
     );
     _program->setUniform("sunDirection", sunDirView);
 
+    const GLboolean cullEnabled = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
+
     for (const auto& [key, tile] : _gpuTiles) {
+        if (tile.indexCount == 0 || tile.vao == 0) {
+            continue;
+        }
         const glm::dmat4 tileModel = glm::translate(modelTransform, tile.originEcef);
         const glm::mat4 modelView = glm::mat4(viewMat * tileModel);
 
@@ -302,6 +384,10 @@ void RenderableOsmBuildings::render(const RenderData& data, RendererTasks&) {
 
         glBindVertexArray(tile.vao);
         glDrawElements(GL_TRIANGLES, tile.indexCount, GL_UNSIGNED_INT, nullptr);
+    }
+
+    if (cullEnabled) {
+        glEnable(GL_CULL_FACE);
     }
 
     glBindVertexArray(0);

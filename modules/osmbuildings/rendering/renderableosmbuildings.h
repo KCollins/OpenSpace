@@ -50,6 +50,7 @@ private:
     };
 
     void requestTileIfNeeded(int z, int x, int y);
+    void evictDistantTiles(const glm::dvec3& camEcef, double maxDistMeters);
     static std::optional<TileMeshData> fetchTileBinary(
         const std::string& baseUrl, int z, int x, int y
     );
